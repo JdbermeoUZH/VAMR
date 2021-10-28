@@ -275,3 +275,5 @@ if __name__ == '__main__':
     # TODO: Use bilineal interpolation to do the undistortioning
 
     # TODO: Create animation to based on the sequence of images
+
+    # TODO: Turn image projection into a class
