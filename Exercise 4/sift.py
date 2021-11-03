@@ -48,6 +48,17 @@ def load_image(image_path: str, re_scale_factor: float = 0.2) -> np.ndarray:
     return resized_image
 
 
+def get_gradient_mag_and_dir(image):
+    # Generate gradients for the image
+    g_x = cv.Sobel(image, cv.CV_64F, 1, 0, ksize=3)
+    g_y = cv.Sobel(image, cv.CV_64F, 0, 1, ksize=3)
+
+    # Get the magnitude and direction
+    g_mag, g_dir = cv.cartToPolar(g_x, g_y, angleInDegrees=False)
+
+    return g_dir, g_mag
+
+
 def get_blurred_images(input_img: np.ndarray, num_scales: int, sigma: float = 1.6) -> np.ndarray:
     blurred_img_list = list()
 
@@ -138,10 +149,10 @@ def locate_keypoints(dog_pyramid: list) -> pd.DataFrame:
         key_point_location['height'] += list(local_maxima_idx[1])
         key_point_location['width'] += list(local_maxima_idx[2])
 
-    return pd.DataFrame(key_point_location)
+    return pd.DataFrame(key_point_location).set_index(['octave', 'scale'])
 
 
-def main(image_dir: str):
+def main(image_dir: str, num_scales: int = 3, num_ocatves: int = 5, sigma: float = 1.6):
     """
     Write code to compute:
     % 1)    image pyramid. Number of images in the pyarmid equals
@@ -162,9 +173,80 @@ def main(image_dir: str):
     img_1 = load_image(image_path=image_paths[0], re_scale_factor=0.2)
     img_2 = load_image(image_path=image_paths[1], re_scale_factor=0.2)
 
-    dog_pyramid_img_1 = generate_dog_pyramid(img_1)
+    dog_pyramid_img_1 = generate_dog_pyramid(img_1, num_scales=num_scales, num_ocatves=num_ocatves, sigma=sigma)
     keypoints_img_1_df = locate_keypoints(dog_pyramid_img_1)
+
+    descriptor_df = get_descriptors(img_1, keypoints_img_1_df, num_scales, sigma)
     print('hello')
+
+
+def get_descriptors(img: np.ndarray, keypoints_img_df: pd.DataFrame, num_scales: int, sigma: float) -> pd.DataFrame:
+    descriptor_dict = {
+        'octave': list(), 'scale': list(), 'height': list(), 'width': list(), 'descriptor': list()
+    }
+
+    # Iterate the keypoints by grouping them first by the specific octave-scale combination we will use
+    for (octave, scale), octave_scale_keypoints_df in keypoints_img_df.groupby(level=['octave', 'scale']):
+        # Calculate new sigma to convolve the whole image
+        new_s = scale - 1 + num_scales * octave  # TODO: Verify if this is a plus or a minus
+        keypoint_sigma = np.power(2, new_s / num_scales) * sigma
+
+        blurred_img_o_s = use_gaussian_filter(input_image=img.copy(), sigma=keypoint_sigma)
+
+        g_dir, g_mag = get_gradient_mag_and_dir(blurred_img_o_s)
+
+        # Iterate over keypoints for the (octave, scale) combination and get the descriptor for each one
+        for row_index, row_values in octave_scale_keypoints_df.iterrows():
+            # Extract keypoint patch
+            width_indexes = (row_values['width'] - 8, row_values['width'] + 8)
+            height_indexes = (row_values['height'] - 8, row_values['height'] + 8)
+
+            # Discard keypoints/descriptors that are too close to the boundary of the image.
+            if (width_indexes[0] < 0 or height_indexes[0] < 0 or width_indexes[1] > blurred_img_o_s.shape[1] or
+                    height_indexes[1] > blurred_img_o_s.shape[0]):
+                continue
+
+            keypoint_patch_g_mag = g_mag[height_indexes[0]: height_indexes[1], width_indexes[0]: width_indexes[1]]
+
+            keypoint_patch_g_dir = g_dir[height_indexes[0]: height_indexes[1], width_indexes[0]: width_indexes[1]]
+
+            # Scale the norm of the gradients by their distance to the keypoint center.
+            #  Create a patch of gaussian of 16x16 and sigma = 1.5*16 and multiply element-wise (weigh each pixel)
+            gaussian_mask_1d = cv.getGaussianKernel(ksize=16, sigma=1.5 * 16)
+            gaussian_mask_2d = np.multiply(gaussian_mask_1d.T, gaussian_mask_1d)
+
+            keypoint_patch_g_mag = keypoint_patch_g_mag * gaussian_mask_2d
+
+            # Divide the 16X16 grid into 8 4x4 sub-patches and calculate the histogram for each
+            descriptor_patch_i = list()
+            for sub_patch_idx_h in range(4):
+                for sub_patch_idx_w in range(4):
+                    sub_patch_g_mag = keypoint_patch_g_mag[
+                                      sub_patch_idx_h * 4: sub_patch_idx_h * 4 + 4,
+                                      sub_patch_idx_w * 4: sub_patch_idx_w * 4 + 4]
+
+                    sub_patch_g_dir = keypoint_patch_g_dir[
+                                      sub_patch_idx_h * 4: sub_patch_idx_h * 4 + 4,
+                                      sub_patch_idx_w * 4: sub_patch_idx_w * 4 + 4]
+
+                    hist_sub_patch_i, _ = np.histogram(sub_patch_g_dir.flatten(), weights=sub_patch_g_mag.flatten(),
+                                                       range=(0, 2 * np.pi), bins=8)
+
+                    descriptor_patch_i.append(hist_sub_patch_i)
+
+            descriptor_patch_i = np.array(descriptor_patch_i).flatten()
+
+            # Normalize descriptor so that it is invariant to illumination changes
+            descriptor_patch_i = descriptor_patch_i/np.linalg.norm(descriptor_patch_i)
+
+            # Add it to the dictionary
+            descriptor_dict['octave'].append(octave)
+            descriptor_dict['scale'].append(scale)
+            descriptor_dict['height'].append(row_values['height'])
+            descriptor_dict['width'].append(row_values['width'])
+            descriptor_dict['descriptor'].append(np.array(descriptor_patch_i).flatten())
+
+    return pd.DataFrame(descriptor_dict).set_index(['octave', 'scale', 'height', 'width'])
 
 
 if __name__ == '__main__':
